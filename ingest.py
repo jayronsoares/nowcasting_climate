@@ -3,6 +3,7 @@ import os, requests, zipfile, io, logging
 import psycopg2, pandas as pd
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
+import math
 
 load_dotenv()
 
@@ -28,10 +29,11 @@ ESTADOS = {"SP", "RJ", "MG", "RS"}
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def safe_float(val):
     try:
-        v = str(val).strip().replace(",", ".")
-        f = float(v)
-        return None if f == -9999.0 else f
-    except Exception:
+        if val in (None, "", "-9999", -9999):
+            return None
+        f = float(val)
+        return None if math.isnan(f) else f
+    except (ValueError, TypeError):
         return None
 
 
