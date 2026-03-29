@@ -1,68 +1,193 @@
-# ingest.py
-import os, requests
-import psycopg2
+# ingest.py — ingestão via ZIP histórico INMET (sem token)
+import os, requests, zipfile, io
+import psycopg2, pandas as pd
 from psycopg2.extras import execute_values
-from datetime import date
 from dotenv import load_dotenv
-from stations import STATIONS
 
 load_dotenv()
 conn = psycopg2.connect(os.getenv("TIMESCALE_URL"))
 
-def fetch_inmet(station_id: str, start: str, end: str) -> list[dict]:
-    url = f"https://apitempo.inmet.gov.br/estacao/{start}/{end}/{station_id}"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    return resp.json() or []
-
-def parse_timestamp(row: dict) -> str | None:
-    date_str = row.get("DT_MEDICAO", "")
-    hour = (row.get("HR_MEDICAO") or "0000")[:4]
-    if not date_str:
-        return None
-    return f"{date_str}T{hour[:2]}:{hour[2:]}:00+00:00"
+# Estados alvo
+ESTADOS = {"SP", "RJ", "MG", "RS"}
 
 def safe_float(val):
     try:
-        return float(val) if val not in (None, "", "-9999", -9999) else None
-    except (ValueError, TypeError):
+        v = str(val).strip().replace(",", ".")
+        f = float(v)
+        return None if f == -9999.0 else f
+    except:
         return None
 
-def insert_batch(rows: list[dict], state: str, station_id: str, lat: float, lon: float):
-    cur = conn.cursor()
+def extract_metadata(lines: list[str]) -> dict:
+    """Extrai UF, station_id, lat, lon do cabeçalho do CSV."""
+    meta = {"uf": None, "station_id": None, "lat": None, "lon": None}
+    for line in lines:
+        l = line.strip()
+        if l.startswith("UF:"):
+            meta["uf"] = l.split(";")[1].strip()
+        elif l.startswith("CODIGO (WMO):"):
+            meta["station_id"] = l.split(";")[1].strip()
+        elif l.startswith("LATITUDE:"):
+            meta["lat"] = safe_float(l.split(";")[1].strip())
+        elif l.startswith("LONGITUDE:"):
+            meta["lon"] = safe_float(l.split(";")[1].strip())
+    return meta
+
+def parse_csv(f, filename: str) -> pd.DataFrame | None:
+    """Lê um CSV do ZIP e retorna DataFrame limpo."""
+    try:
+        raw = f.read().decode("latin1").splitlines()
+
+        # Extrai metadados do cabeçalho (primeiras 8 linhas)
+        meta = extract_metadata(raw[:8])
+
+        # Filtra apenas estados alvo
+        if meta["uf"] not in ESTADOS:
+            return None
+
+        # Dados começam após o cabeçalho (linha 9 em diante)
+        header_idx = next(
+            (i for i, l in enumerate(raw) if l.startswith("Data;Hora")), 8
+        )
+        data_lines = raw[header_idx:]
+        if len(data_lines) < 2:
+            return None
+
+        df = pd.read_csv(
+            io.StringIO("\n".join(data_lines)),
+            sep=";",
+            encoding="latin1",
+            decimal=",",
+            on_bad_lines="skip",
+        )
+
+        df.columns = [c.strip() for c in df.columns]
+
+        # Mapeia colunas para nomes padronizados
+        col_map = {
+            "Data":                                              "date",
+            "Hora UTC":                                          "hour",
+            "PRECIPITAÇÃO TOTAL, HORÁRIO (mm)":                 "rain_mm",
+            "TEMPERATURA DO AR - BULBO SECO, HORARIA (°C)":     "temp_c",
+            "UMIDADE RELATIVA DO AR, HORARIA (%)":               "humidity",
+            "PRESSAO ATMOSFERICA AO NIVEL DA ESTACAO, HORARIA (mB)": "pressure",
+            "VENTO, VELOCIDADE HORARIA (m/s)":                  "wind_speed",
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+        # Garante colunas mínimas
+        required = ["date", "hour", "rain_mm"]
+        if not all(c in df.columns for c in required):
+            return None
+
+        # Preenche colunas ausentes com None
+        for col in ["temp_c", "humidity", "pressure", "wind_speed"]:
+            if col not in df.columns:
+                df[col] = None
+
+        # Cria timestamp UTC
+        df["hour_str"] = df["hour"].astype(str).str.zfill(4)
+        df["ts"] = pd.to_datetime(
+            df["date"].astype(str) + " " + df["hour_str"].str[:2] + ":" + df["hour_str"].str[2:],
+            format="%Y-%m-%d %H:%M",
+            errors="coerce",
+            utc=True,
+        )
+        df = df.dropna(subset=["ts"])
+
+        # Adiciona metadados
+        df["state_code"] = meta["uf"]
+        df["station_id"] = meta["station_id"]
+        df["lat"]        = meta["lat"]
+        df["lon"]        = meta["lon"]
+
+        return df[["state_code", "station_id", "lat", "lon", "ts",
+                   "rain_mm", "temp_c", "humidity", "pressure", "wind_speed"]]
+
+    except Exception as e:
+        print(f"  ✗ Erro ao parsear {filename}: {e}")
+        return None
+
+def insert_df(df: pd.DataFrame):
+    """Insere DataFrame no Timescale com execute_values."""
     records = []
-    for r in rows:
-        ts = parse_timestamp(r)
-        if not ts:
-            continue
+    for _, row in df.iterrows():
         records.append((
-            state, station_id, lat, lon, None, ts,
-            safe_float(r.get("CHUVA")),
-            safe_float(r.get("TEM_INS")),
-            safe_float(r.get("UMD_INS")),
-            safe_float(r.get("PRE_INS")),
-            safe_float(r.get("VEN_VEL")),
+            row["state_code"],
+            row["station_id"],
+            row["lat"],
+            row["lon"],
+            None,  # grid_id
+            row["ts"],
+            safe_float(row["rain_mm"]),
+            safe_float(row["temp_c"]),
+            safe_float(row["humidity"]),
+            safe_float(row["pressure"]),
+            safe_float(row["wind_speed"]),
         ))
-    if records:
-        execute_values(cur, """
-            INSERT INTO weather_observations
-                (state_code, station_id, lat, lon, grid_id, ts,
-                 rain_mm, temp_c, humidity, pressure, wind_speed)
-            VALUES %s
-            ON CONFLICT (station_id, ts) DO NOTHING
-        """, records)
-        conn.commit()
+
+    if not records:
+        return 0
+
+    cur = conn.cursor()
+    execute_values(cur, """
+        INSERT INTO weather_observations
+            (state_code, station_id, lat, lon, grid_id, ts,
+             rain_mm, temp_c, humidity, pressure, wind_speed)
+        VALUES %s
+        ON CONFLICT (station_id, ts) DO NOTHING
+    """, records, page_size=1000)
+    conn.commit()
     cur.close()
+    return len(records)
 
-def run(start: str = "2022-01-01"):
-    end = date.today().isoformat()
-    for state, stations in STATIONS.items():
-        for (sid, lat, lon) in stations:
-            try:
-                rows = fetch_inmet(sid, start, end)
-                insert_batch(rows, state, sid, lat, lon)
-                print(f"✓ {state} / {sid} — {len(rows)} registros")
-            except Exception as e:
-                print(f"✗ {state} / {sid} — erro: {e}")
+def ingest_year(year: int):
+    url = f"https://portal.inmet.gov.br/uploads/dadoshistoricos/{year}.zip"
+    print(f"\n{'='*50}")
+    print(f"Baixando {year}.zip ...")
 
-run("2022-01-01")
+    resp = requests.get(url, timeout=180)
+    if resp.status_code != 200:
+        print(f"✗ Erro HTTP {resp.status_code} para {year}.zip")
+        return
+
+    print(f"✓ {len(resp.content)/1024/1024:.1f} MB baixados")
+
+    z       = zipfile.ZipFile(io.BytesIO(resp.content))
+    csvs    = [f for f in z.namelist() if f.upper().endswith(".CSV")]
+    total   = 0
+    estados = {e: 0 for e in ESTADOS}
+
+    for fname in csvs:
+        with z.open(fname) as f:
+            df = parse_csv(f, fname)
+            if df is None:
+                continue
+            n = insert_df(df)
+            total += n
+            estados[df["state_code"].iloc[0]] += n
+
+    print(f"\n✓ {year} concluído — {total:,} registros inseridos")
+    for estado, count in sorted(estados.items()):
+        if count:
+            print(f"  {estado}: {count:,}")
+
+def run(years: list[int]):
+    for year in years:
+        ingest_year(year)
+
+    # Verificação final
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT state_code, COUNT(*) AS total, MIN(ts), MAX(ts)
+        FROM weather_observations
+        GROUP BY state_code
+        ORDER BY state_code
+    """)
+    print("\n=== RESULTADO FINAL ===")
+    for row in cur.fetchall():
+        print(f"{row[0]}: {row[1]:,} registros | {row[2].date()} → {row[3].date()}")
+    conn.close()
+
+# Carrega 2022, 2023, 2024 e 2025
+run([2022, 2023, 2024, 2025])
