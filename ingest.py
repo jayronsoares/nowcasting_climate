@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Conexão ─────────────────────────────────────────────────────────────────
+# ── Conexão ──────────────────────────────────────────────────────────────────
 conn = psycopg2.connect(os.getenv("TIMESCALE_URL"))
 
 # Estados alvo
@@ -70,10 +70,12 @@ def parse_csv(f, filename: str) -> pd.DataFrame | None:
             log.warning("CSV sem dados: %s", filename)
             return None
 
+        # dtype=str preserva formato original de data/hora
+        # evita que "0000 UTC" seja convertido para float
         df = pd.read_csv(
             io.StringIO("\n".join(data_lines)),
             sep=";",
-            decimal=",",
+            dtype=str,
             on_bad_lines="skip",
         )
         df.columns = [c.strip() for c in df.columns]
@@ -99,18 +101,30 @@ def parse_csv(f, filename: str) -> pd.DataFrame | None:
             if col not in df.columns:
                 df[col] = None
 
-        # Cria timestamp UTC
-        df["hour_str"] = df["hour"].astype(str).str.zfill(4)
+        # ── Timestamp ────────────────────────────────────────────────────────
+        # Data: "2023/01/01" → normaliza separador → "2023-01-01"
+        # Hora: "0000 UTC"  → remove sufixo, zfill 4 → "0000"
+        df["date_clean"] = (
+            df["date"].astype(str)
+            .str.replace("/", "-", regex=False)
+            .str.strip()
+        )
+        df["hour_clean"] = (
+            df["hour"].astype(str)
+            .str.replace(" UTC", "", regex=False)
+            .str.strip()
+            .str.zfill(4)
+        )
         df["ts"] = pd.to_datetime(
-            df["date"].astype(str) + " " +
-            df["hour_str"].str[:2] + ":" + df["hour_str"].str[2:],
+            df["date_clean"] + " " +
+            df["hour_clean"].str[:2] + ":" + df["hour_clean"].str[2:],
             format="%Y-%m-%d %H:%M",
             errors="coerce",
             utc=True,
         )
         df = df.dropna(subset=["ts"])
 
-        # Guard: retorna None se DataFrame ficou vazio após limpeza
+        # Guard: DataFrame vazio após limpeza
         if df.empty:
             log.warning("DataFrame vazio após limpeza: %s", filename)
             return None
@@ -184,9 +198,9 @@ def ingest_year(year: int):
     csvs = [f for f in z.namelist() if f.upper().endswith(".CSV")]
     log.info("%d arquivos CSV encontrados no ZIP", len(csvs))
 
-    total_year   = 0
-    contagem_uf  = {e: 0 for e in ESTADOS}
-    erros        = 0
+    total_year  = 0
+    contagem_uf = {e: 0 for e in ESTADOS}
+    erros       = 0
 
     for fname in csvs:
         try:
@@ -201,14 +215,15 @@ def ingest_year(year: int):
 
             total_year      += n
             contagem_uf[uf] += n
-            log.debug("  ✓ %s — %d registros", fname, n)
 
         except Exception as e:
             erros += 1
-            log.error("  ✗ Erro em %s: %s", fname, e)
+            log.error("Erro em %s: %s", fname, e)
 
-    log.info("--- %d concluído: %d registros inseridos | erros: %d ---",
-             year, total_year, erros)
+    log.info(
+        "--- %d concluído: %d registros inseridos | erros: %d ---",
+        year, total_year, erros
+    )
     for uf, count in sorted(contagem_uf.items()):
         if count:
             log.info("  %s: %d registros", uf, count)
