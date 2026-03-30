@@ -66,10 +66,12 @@ def add_cyclic_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def risk_label(p: float) -> str:
-    if p < 0.3: return "baixo"
-    if p < 0.6: return "moderado"
-    if p < 0.8: return "alto"
+def risk_label(p: float, threshold: float) -> str:
+    # Bandas relativas ao threshold calibrado — nunca hardcoded.
+    # Garante invariante: critico ↔ burst=1, sempre.
+    if p < threshold * 0.50: return "baixo"
+    if p < threshold * 0.80: return "moderado"
+    if p < threshold:        return "alto"
     return "critico"
 
 
@@ -79,31 +81,26 @@ def predictions():
     """
     Agrega weather_features por estado e retorna probabilidade e nível de risco.
 
-    Mudança em relação ao MVP original:
-      - rain_1h / rain_3h / rain_6h / rain_avg_3h: PERCENTILE_CONT(0.90)
-        em vez de AVG. O p90 representa o pior decil de estações no estado,
-        tornando o sistema sensível a eventos locais sem diluir o sinal
-        pela média das 40–59 estações restantes.
-      - rain_diff / variáveis meteorológicas: mantêm AVG (são derivadas ou
-        representam condições de fundo, não extremos pontuais).
-      - hour_ts (MAX): necessário para derivar features cíclicas idênticas
-        às usadas no treino.
+    Agregação: AVG para todas as features.
+    O modelo foi treinado em linhas individuais por estação (weather_dataset).
+    AVG é o único agregador consistente com essa distribuição — PERCENTILE_CONT(0.90)
+    infla os inputs acima da distribuição vista no treino, causando falsos críticos.
+    Migração para previsão por estação (Phase 3) eliminará essa limitação.
     """
     try:
         df = pd.read_sql(
             """
             SELECT
                 state_code,
-                MAX(hour_ts)                                                     AS hour_ts,
-                PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY rain_1h)            AS rain_1h,
-                PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY rain_3h)            AS rain_3h,
-                PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY rain_6h)            AS rain_6h,
-                PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY rain_avg_3h)        AS rain_avg_3h,
-                AVG(rain_diff)                                                   AS rain_diff,
-                AVG(temp_avg)                                                    AS temp_avg,
-                AVG(humidity_avg)                                                AS humidity_avg,
-                AVG(pressure_avg)                                                AS pressure_avg,
-                AVG(wind_avg)                                                    AS wind_avg
+                MAX(hour_ts)      AS hour_ts,
+                AVG(rain_1h)      AS rain_1h,
+                AVG(rain_3h)      AS rain_3h,
+                AVG(rain_6h)      AS rain_6h,
+                AVG(rain_diff)    AS rain_diff,
+                AVG(temp_avg)     AS temp_avg,
+                AVG(humidity_avg) AS humidity_avg,
+                AVG(pressure_avg) AS pressure_avg,
+                AVG(wind_avg)     AS wind_avg
             FROM weather_features
             WHERE hour_ts = (SELECT MAX(hour_ts) FROM weather_features)
               AND state_code IN ('SP', 'RJ', 'MG', 'RS')
@@ -119,8 +116,9 @@ def predictions():
         log.warning("/predictions: weather_features vazio ou sem dados recentes.")
         raise HTTPException(status_code=404, detail="Nenhum dado recente encontrado.")
 
-    # Features meteorológicas base — descarta linhas com qualquer NaN
-    base_features = [f for f in FEATURES if f not in ("hour_sin", "hour_cos", "month_sin", "month_cos")]
+    # Cyclic features are derived — they never produce NaN
+    # Drop rows only on features that come from SQL
+    base_features = [f for f in FEATURES if not f.endswith(("_sin", "_cos"))]
     df = df.dropna(subset=base_features)
 
     if df.empty:
@@ -133,7 +131,7 @@ def predictions():
     # Inferência
     df["probability"] = model.predict_proba(df[FEATURES])[:, 1]
     df["burst"]       = (df["probability"] >= THRESHOLD).astype(int)
-    df["risk"]        = df["probability"].apply(risk_label)
+    df["risk"]        = df["probability"].apply(lambda p: risk_label(p, THRESHOLD))
 
     log.info(
         "/predictions: %d estados | burst detectado: %s",

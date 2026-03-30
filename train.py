@@ -25,9 +25,16 @@ engine = create_engine(os.getenv("TIMESCALE_URL").replace("postgres://", "postgr
 # Features cíclicas (hour_*, month_*) são derivadas em Python a partir de hour_ts
 # — sem alteração de schema necessária.
 FEATURES = [
-    "rain_1h", "rain_3h", "rain_6h", "rain_avg_3h", "rain_diff",
+    # Magnitude e acumulado — janelas de tempo distintas, não redundantes
+    "rain_1h", "rain_3h", "rain_6h",
+    # Taxa de intensificação — sinal de EVOLUÇÃO da chuva para tempestade
+    "rain_diff",
+    # Condições atmosféricas de fundo
     "temp_avg", "humidity_avg", "pressure_avg", "wind_avg",
+    # Sazonalidade cíclica — derivadas em Python, não requerem schema change
     "hour_sin", "hour_cos", "month_sin", "month_cos",
+    # rain_avg_3h removido: AVG(rain_mm/3h) é proporcional a rain_3h=SUM(rain_mm/3h)
+    # em dados horários sem lacunas — redundante confirmado por feature importance=1
 ]
 
 # ── Helpers de feature engineering ───────────────────────────────────────────
